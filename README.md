@@ -1,6 +1,6 @@
 # ucai
 
-**Air-Gapped Local LLM Agent with Decoupled Tool Sandboxing over MCP**
+**Host-Isolated Local LLM Agent with Decoupled Tool Sandboxing over MCP**
 
 `ucai` is an architecture and toolkit for running a private, self-hosted autonomous agent. It physically separates model inference from tool execution across a secure network mesh (e.g., Tailscale), ensuring that external tool calls, filesystem operations, and internet browsing cannot compromise the primary compute host.
 
