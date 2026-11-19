@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "ucai": {
+      "command": "/usr/bin/ssh",
+      "args": [
+        "-T",
+        "-i",
+        "__SANDBOX_SSH_KEY__",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "LogLevel=ERROR",
+        "__SANDBOX_USER_AT_HOST__",
+        "__SANDBOX_PYTHON__",
+        "__SANDBOX_DIR__/mcp_ucai.py"
+      ]
+    },
+    "web": {
+      "command": "__COMPUTE_PYTHON__",
+      "args": [
+        "__INFERENCE_NODE_DIR__/web_mcp.py"
+      ]
+    }
+  }
+}

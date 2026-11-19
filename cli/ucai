@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+# Source local environment variables if available
+if [[ -f "$ROOT/.env" ]]; then
+  # shellcheck source=/dev/null
+  source "$ROOT/.env"
+elif [[ -f "$HOME/.ucai.env" ]]; then
+  # shellcheck source=/dev/null
+  source "$HOME/.ucai.env"
+fi
+
+SERVER="${UCAI_COMPUTE_HOST:-user@compute-node}"
+LLAMA="${UCAI_LLAMA_SCRIPT:-$HOME/models/llama.sh}"
+URL="${UCAI_URL:-http://127.0.0.1:8080}"
+SANDBOX_SSH="${UCAI_SANDBOX_HOST:-user@sandbox-node}"
+SANDBOX_KEY="${UCAI_SANDBOX_KEY:-$HOME/.ssh/ucai_sandbox}"
+PY="${UCAI_PYTHON:-python3}"
+PID_CAF="/tmp/ucai.caffeinate.pid"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8)
+
+remote() { ssh "${SSH_OPTS[@]}" "$SERVER" "$@"; }
+
+health_code() { curl -s -o /dev/null -m 3 -w '%{http_code}' "$URL/health" 2>/dev/null || echo "000"; }
+
+server_reachable() { remote true >/dev/null 2>&1; }
+
+sandbox_reachable_from_server() {
+  remote "/usr/bin/ssh -T -i $SANDBOX_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -o IdentitiesOnly=yes -o LogLevel=ERROR $SANDBOX_SSH true" >/dev/null 2>&1
+}
+
+start_caffeinate() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    if [[ -f "$PID_CAF" ]] && kill -0 "$(cat "$PID_CAF")" 2>/dev/null; then
+      return
+    fi
+    nohup /usr/bin/caffeinate -dimsu >/dev/null 2>&1 < /dev/null &
+    echo $! > "$PID_CAF"
+  fi
+}
+
+stop_caffeinate() {
+  if [[ -f "$PID_CAF" ]]; then
+    local pid
+    pid="$(cat "$PID_CAF")"
+    kill "$pid" 2>/dev/null || true
+    rm -f "$PID_CAF"
+  fi
+}
+
+wait_healthy() {
+  local i code
+  for i in {1..150}; do
+    code="$(health_code)"
+    if [[ "$code" == "200" ]]; then
+      echo
+      echo "[✓] Server is healthy and listening."
+      return 0
+    fi
+    printf '.'
+    sleep 2
+  done
+  echo
+  echo "[!] Server did not respond with 200 OK within 300 seconds."
+  echo "Recent remote logs:"
+  remote "tail -30 ~/Library/Logs/llama-server.log 2>/dev/null || true"
+  return 1
+}
+
+up() {
+  if ! server_reachable; then
+    echo "[!] Error: Cannot reach compute host ($SERVER). Verify network/VPN connection."
+    exit 1
+  fi
+  if ! sandbox_reachable_from_server; then
+    echo "[!] Warning: Compute server cannot authenticate to sandbox host ($SANDBOX_SSH)."
+    echo "    Run: ./cli/ucai doctor"
+    exit 1
+  fi
+  if remote "$LLAMA status" 2>/dev/null | grep -q RUNNING; then
+    echo "[*] llama-server is already running."
+  else
+    echo "[*] Starting remote inference engine on $SERVER..."
+    remote "$LLAMA start"
+    printf 'Warming up'
+  fi
+  if [[ "$(health_code)" != "200" ]]; then
+    wait_healthy || exit 1
+  fi
+  start_caffeinate
+  echo "[✓] Web UI accessible at: $URL"
+  if command -v open >/dev/null 2>&1; then
+    open "$URL" 2>/dev/null || true
+  fi
+}
+
+down() {
+  if server_reachable; then
+    echo "[*] Terminating remote inference engine..."
+    remote "$LLAMA stop"
+  else
+    echo "[!] Cannot reach $SERVER; remote daemon was not stopped."
+  fi
+  stop_caffeinate
+  echo "[✓] ucai session stopped."
+}
+
+status() {
+  if ! server_reachable; then
+    echo "Compute Server: UNREACHABLE ($SERVER)"
+  else
+    echo "Compute Server: $(remote "$LLAMA status" 2>/dev/null || echo 'UNKNOWN')"
+    echo "Health Endpoint: $(health_code)"
+    if sandbox_reachable_from_server; then
+      echo "Sandbox Bridge: REACHABLE"
+    else
+      echo "Sandbox Bridge: UNREACHABLE ($SANDBOX_SSH)"
+    fi
+    local tools
+    tools="$(curl -s -m 5 "$URL/tools" 2>/dev/null || true)"
+    if [[ -n "$tools" ]]; then
+      echo "Registered MCP Tools: $(printf '%s' "$tools" | "$PY" -c 'import sys,json; d=json.load(sys.stdin); print(len(d))' 2>/dev/null || echo '?')"
+    else
+      echo "Registered MCP Tools: Unavailable"
+    fi
+  fi
+  if [[ -f "$PID_CAF" ]] && kill -0 "$(cat "$PID_CAF")" 2>/dev/null; then
+    echo "Host Keep-Awake: RUNNING"
+  else
+    echo "Host Keep-Awake: STOPPED"
+  fi
+}
+
+doctor() {
+  local fail=0
+  echo "--- Running ucai Diagnostic Suite ---"
+  if server_reachable; then 
+    echo "[✓] Compute host reachable ($SERVER)"
+  else 
+    echo "[✗] FAIL: Compute host unreachable ($SERVER)"; fail=1
+  fi
+  if sandbox_reachable_from_server; then 
+    echo "[✓] Compute-to-Sandbox SSH transport authenticated"
+  else 
+    echo "[✗] FAIL: Compute-to-Sandbox SSH authentication failed ($SANDBOX_SSH)"; fail=1
+  fi
+  local code
+  code="$(health_code)"
+  if [[ "$code" == "200" ]]; then 
+    echo "[✓] llama-server HTTP health verified (200 OK)"
+  else 
+    echo "[!] Notice: llama-server not currently active (status: $code)"
+  fi
+  local tools
+  tools="$(curl -s -m 5 "$URL/tools" 2>/dev/null || true)"
+  if [[ -n "$tools" ]]; then
+    local count
+    count="$(printf '%s' "$tools" | "$PY" -c 'import sys,json; d=json.load(sys.stdin); print(len(d))' 2>/dev/null || echo '0')"
+    echo "[✓] MCP tools registered with model runtime ($count discovered)"
+  else
+    echo "[!] Notice: MCP /tools endpoint inactive"
+  fi
+  echo "-------------------------------------"
+  [[ "$fail" == "0" ]] && echo "[✓] Diagnostics passed successfully."
+  return "$fail"
+}
+
+usage() {
+  cat <<EOF
+ucai - Decoupled Local LLM Agent via Model Context Protocol
+
+Usage: ucai <command>
+
+Commands:
+  up, start       Launch remote llama-server, wait for health, open Web UI, maintain wakefulness
+  down, stop      Shut down remote inference engine and free host memory
+  status          Display compute health, sandbox transport, and registered MCP tools
+  restart         Restart remote inference daemon
+  logs            Tail live server log stream over SSH
+  doctor          Run end-to-end connectivity, key authentication, and MCP discovery checks
+  -h, --help      Display this help documentation
+
+Topology:
+  Inference Node: Remote model server (llama.cpp Web UI, Qwen 27B, 262k context)
+  Tool Node:      Isolated execution sandbox (Filesystem jail, FTS5 memory, read-only shell)
+  Transport:      Encrypted SSH stdio forwarding over private network mesh
+EOF
+}
+
+case "${1:-up}" in
+  up|start|"") up ;;
+  down|stop) down ;;
+  status) status ;;
+  restart) down; sleep 2; up ;;
+  logs) remote "$LLAMA logs" ;;
+  doctor) doctor ;;
+  -h|--help|help) usage ;;
+  *)
+    usage
+    ;;
+esac
